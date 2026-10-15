@@ -1,0 +1,6 @@
+{
+  "name": "極・五厘賽チンチロ 3D",
+  "description": "5個のサイコロと特製ルールで競う本格3Dチンチロリン。リアル物理演算と重厚な和モダン演出。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
