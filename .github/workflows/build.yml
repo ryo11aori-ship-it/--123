@@ -1,0 +1,21 @@
+{
+"name": "Build Chinchiro HTML",
+"on": {
+"push": {"branches": ["*"]},
+"pull_request": {"branches": ["*"]},
+"workflow_dispatch": {}
+},
+"jobs": {
+"build": {
+"runs-on": "ubuntu-latest",
+"steps": [
+{"name": "Checkout", "uses": "actions/checkout@v4"},
+{"name": "Setup Bun", "uses": "oven-sh/setup-bun@v2", "with": {"bun-version": "latest"}},
+{"name": "Install dependencies", "run": "bun install"},
+{"name": "Build project", "run": "bun run build"},
+{"name": "Bundle into single HTML", "run": "bun -e 'const fs=require(\"fs\"),path=require(\"path\");let h=fs.readFileSync(\"dist/index.html\",\"utf8\");h=h.replace(/<link\\b[^>]*?\\brel=[\\x22\\x27]modulepreload[\\x22\\x27][^>]*>/gi,\"\");h=h.replace(/<link\\b[^>]*?\\bhref=[\\x22\\x27]([^\\x22\\x27]+\\.css)[\\x22\\x27][^>]*>/gi,(m,u)=>/^https?:/i.test(u)?m:\"<style>\"+fs.readFileSync(path.join(\"dist\",u.replace(/^\\.?\\//,\"\")),\"utf8\").replace(/<\\/style/gi,\"<\\\\/style\")+\"</style>\");h=h.replace(/<script\\b[^>]*?\\bsrc=[\\x22\\x27]([^\\x22\\x27]+\\.js)[\\x22\\x27][^>]*>\\s*<\\/script>/gi,(m,u)=>/^https?:/i.test(u)?m:\"<script type=\\x22module\\x22>\"+fs.readFileSync(path.join(\"dist\",u.replace(/^\\.?\\//,\"\")),\"utf8\").replace(/<\\/script/gi,\"<\\\\/script\")+\"</script>\");fs.writeFileSync(\"chinchiro.html\",h,\"utf8\");fs.writeFileSync(\"dist/index.html\",h,\"utf8\");'"},
+{"name": "Upload HTML Artifact", "uses": "actions/upload-artifact@v4", "with": {"name": "chinchiro-html", "path": "chinchiro.html"}}
+]
+}
+}
+}
