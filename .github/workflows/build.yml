@@ -1,21 +1,347 @@
-{
-"name": "Build Chinchiro HTML",
-"on": {
-"push": {"branches": ["*"]},
-"pull_request": {"branches": ["*"]},
-"workflow_dispatch": {}
-},
-"jobs": {
-"build": {
-"runs-on": "ubuntu-latest",
-"steps": [
-{"name": "Checkout", "uses": "actions/checkout@v4"},
-{"name": "Setup Bun", "uses": "oven-sh/setup-bun@v2", "with": {"bun-version": "latest"}},
-{"name": "Install dependencies", "run": "bun install"},
-{"name": "Build project", "run": "bun run build"},
-{"name": "Bundle into single HTML", "run": "bun -e 'const fs=require(\"fs\"),path=require(\"path\");let h=fs.readFileSync(\"dist/index.html\",\"utf8\");h=h.replace(/<link\\b[^>]*?\\brel=[\\x22\\x27]modulepreload[\\x22\\x27][^>]*>/gi,\"\");h=h.replace(/<link\\b[^>]*?\\bhref=[\\x22\\x27]([^\\x22\\x27]+\\.css)[\\x22\\x27][^>]*>/gi,(m,u)=>/^https?:/i.test(u)?m:\"<style>\"+fs.readFileSync(path.join(\"dist\",u.replace(/^\\.?\\//,\"\")),\"utf8\").replace(/<\\/style/gi,\"<\\\\/style\")+\"</style>\");h=h.replace(/<script\\b[^>]*?\\bsrc=[\\x22\\x27]([^\\x22\\x27]+\\.js)[\\x22\\x27][^>]*>\\s*<\\/script>/gi,(m,u)=>/^https?:/i.test(u)?m:\"<script type=\\x22module\\x22>\"+fs.readFileSync(path.join(\"dist\",u.replace(/^\\.?\\//,\"\")),\"utf8\").replace(/<\\/script/gi,\"<\\\\/script\")+\"</script>\");fs.writeFileSync(\"chinchiro.html\",h,\"utf8\");fs.writeFileSync(\"dist/index.html\",h,\"utf8\");'"},
-{"name": "Upload HTML Artifact", "uses": "actions/upload-artifact@v4", "with": {"name": "chinchiro-html", "path": "chinchiro.html"}}
-]
-}
-}
-}
+name: Build single-file HTML
+
+# ゲーム全体 (three.js / React / 物理シミュレータ) を、1枚の HTML ファイル chinchiro.html にビルドして
+# 成果物 (Artifacts) に出します。ダブルクリックで開いて遊べます (インターネット接続は Google Fonts のみ・無くても動作)。
+#
+#  - main / master への push、Pull Request、手動実行 (Actions タブ → Run workflow) で動きます
+#  - v で始まるタグ (例: v1.0.0) を push すると、GitHub Releases にも chinchiro.html を添付します
+#  - 型検査・メッシュ検証・物理の簡易検証・ブラウザ起動テストは「失敗してもHTMLは出力する」設定です
+#    (結果は実行画面の Summary と、成果物 smoke-test に出ます)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash # pipefail が有効になる (tee を通しても失敗を検知できる)
+
+jobs:
+  build:
+    name: Build chinchiro.html
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22 # Vite 8 は Node 20.19+ / 22.12+ が必要
+
+      - name: Setup Bun (bun.lock があるため)
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            ~/.npm
+          key: deps-${{ runner.os }}-${{ hashFiles('package.json', 'bun.lock', 'bun.lockb', 'package-lock.json') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then
+            # bun.lock を尊重。失敗したら lock 無視 → さらに失敗したら npm へ
+            bun install --frozen-lockfile \
+              || bun install \
+              || npm install --no-audit --no-fund --legacy-peer-deps
+          else
+            npm install --no-audit --no-fund --legacy-peer-deps
+          fi
+
+      # ---- 検証 (失敗しても先へ進む) ----------------------------------------
+      - name: Verify bowl mesh matches collision shape
+        id: mesh
+        continue-on-error: true
+        run: npm run verify:mesh 2>&1 | tee mesh.log
+
+      - name: Type check
+        id: lint
+        continue-on-error: true
+        run: npm run lint 2>&1 | tee lint.log
+
+      - name: Physics Monte-Carlo (quick)
+        id: physics
+        continue-on-error: true
+        run: npm run verify:physics -- --quick 2>&1 | tee physics.log
+
+      # ---- ビルド ------------------------------------------------------------
+      - name: Build (vite)
+        id: build
+        run: npm run build -- --base=./
+
+      - name: Inline JS/CSS into a single HTML
+        id: inline
+        run: |
+          cat > "$RUNNER_TEMP/inline-html.mjs" <<'EOF'
+          import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+          import { dirname, extname, join } from 'node:path';
+
+          const [distDir = 'dist', outFile = 'dist-html/chinchiro.html'] = process.argv.slice(2);
+          const indexPath = join(distDir, 'index.html');
+          if (!existsSync(indexPath)) {
+            console.error(`NG: ${indexPath} が見つかりません (vite build が失敗していませんか?)`);
+            process.exit(1);
+          }
+          let html = readFileSync(indexPath, 'utf8');
+
+          const isRemote = (u) => /^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(u) || /^(?:data|blob):/i.test(u);
+          const attr = (tag, name) => {
+            const m = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
+            return m ? (m[1] ?? m[2] ?? m[3]) : null;
+          };
+          const assetPath = (ref) => join(distDir, ref.split(/[?#]/)[0].replace(/^(?:\.\/|\/)+/, ''));
+          const readText = (ref) => readFileSync(assetPath(ref), 'utf8');
+          const MIME = { '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
+
+          let css = 0;
+          let js = 0;
+          let icons = 0;
+
+          // <link rel="stylesheet"> → <style> / modulepreload は不要 / icon は data URI
+          html = html.replace(/<link\b[^>]*>/gi, (tag) => {
+            const rels = (attr(tag, 'rel') || '').toLowerCase().split(/\s+/);
+            const href = attr(tag, 'href');
+            if (!href || isRemote(href)) return tag;
+            if (rels.includes('stylesheet')) {
+              css++;
+              return `<style>\n${readText(href).replace(/<\/style/gi, '<\\/style')}\n</style>`;
+            }
+            if (rels.includes('modulepreload')) return '';
+            if (rels.includes('icon') && existsSync(assetPath(href))) {
+              icons++;
+              const mime = MIME[extname(href.split(/[?#]/)[0]).toLowerCase()] || 'application/octet-stream';
+              const b64 = readFileSync(assetPath(href)).toString('base64');
+              return tag.replace(href, `data:${mime};base64,${b64}`);
+            }
+            return tag;
+          });
+
+          // <script src="..."> → インライン。HTML パーサを壊す並びだけをエスケープ
+          html = html.replace(/<script\b[^>]*>\s*<\/script>/gi, (tag) => {
+            const src = attr(tag, 'src');
+            if (!src || isRemote(src)) return tag;
+            js++;
+            const type = attr(tag, 'type') || 'text/javascript';
+            const code = readText(src)
+              .replace(/<\/script/gi, '<\\/script')
+              .replace(/<!--/g, '\\x3C!--');
+            return `<script type="${type}">\n${code}\n</script>`;
+          });
+
+          // 取り残し (assets/ への参照) があれば失敗
+          const leftover = [...html.matchAll(/(?:src|href)\s*=\s*["']((?:\.\/|\/)?assets\/[^"']+)["']/g)].map((m) => m[1]);
+          if (leftover.length > 0) {
+            console.error('NG: 埋め込めていない参照があります:', leftover);
+            process.exit(1);
+          }
+          if (js === 0) {
+            console.error('NG: インライン化したスクリプトが 0 件です (index.html の構造が想定と違います)');
+            process.exit(1);
+          }
+
+          // 別チャンクへの相対 import が残っていると、埋め込むだけでは動かないので検出して失敗にする
+          const chunkRefs = new Set();
+          for (const m of html.matchAll(/(?:\bimport\s*\(\s*|\bfrom\s*|\bimport\s*)["']\.\/([^"']+\.js)["']/g)) {
+            if (existsSync(join(distDir, 'assets', m[1])) || existsSync(join(distDir, m[1]))) chunkRefs.add(m[1]);
+          }
+          if (chunkRefs.size > 0) {
+            console.error('NG: 別チャンクへの import が残っています (単一ファイルにできません):', [...chunkRefs]);
+            process.exit(1);
+          }
+
+          const stamp = `<!-- chinchiro single-file build: ${(process.env.GITHUB_SHA || 'local').slice(0, 7)} / ${new Date().toISOString()} -->`;
+          html = /<!doctype html>/i.test(html) ? html.replace(/<!doctype html>/i, (m) => `${m}\n${stamp}`) : `${stamp}\n${html}`;
+
+          mkdirSync(dirname(outFile), { recursive: true });
+          writeFileSync(outFile, html);
+          const kb = (statSync(outFile).size / 1024).toFixed(0);
+          console.log(`OK: ${outFile}  ${kb} KB  (script ${js} / style ${css} / icon ${icons})`);
+          EOF
+          node "$RUNNER_TEMP/inline-html.mjs" dist dist-html/chinchiro.html
+          ls -lh dist-html
+
+      - name: Upload artifact (chinchiro.html)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinchiro-html
+          path: dist-html/chinchiro.html
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---- ブラウザ起動テスト (失敗しても先へ進む) --------------------------
+      - name: Smoke test in headless Chromium
+        id: smoke
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" smoke
+          cat > "$RUNNER_TEMP/pw/smoke.mjs" <<'EOF'
+          import { chromium } from 'playwright';
+          import { mkdirSync, writeFileSync } from 'node:fs';
+          import { pathToFileURL } from 'node:url';
+
+          const [file, outDir] = process.argv.slice(2);
+          mkdirSync(outDir, { recursive: true });
+          const notes = [];
+          const errors = [];
+          const warnings = [];
+          const note = (s) => {
+            console.log(s);
+            notes.push(s);
+          };
+
+          const browser = await chromium.launch({
+            args: ['--no-sandbox', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],
+          });
+          const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+          page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
+          page.on('console', (m) => {
+            if (m.type() === 'error') errors.push(`console.error: ${m.text()}`);
+            else if (m.type() === 'warning') warnings.push(`console.warn: ${m.text()}`);
+          });
+          const shot = (name) => page.screenshot({ path: `${outDir}/${name}.png` });
+          const t0 = Date.now();
+
+          try {
+            await page.goto(pathToFileURL(file).href, { waitUntil: 'load' });
+            await page.waitForSelector('canvas', { timeout: 60000 });
+            note(`canvas 生成 OK (${Date.now() - t0}ms)`);
+            await page.waitForTimeout(2500);
+            await shot('01-setup');
+
+            await page.getByRole('button', { name: 'ゲーム開始' }).click({ timeout: 15000 });
+            note('「ゲーム開始」をクリック');
+            await page.waitForTimeout(3000);
+            await shot('02-game');
+
+            const roll = page.getByRole('button', { name: 'サイコロを振る' });
+            if ((await roll.count()) > 0) {
+              await roll.first().click({ timeout: 10000 });
+              note('「サイコロを振る」をクリック');
+            } else {
+              note('最初の手番が CPU のため、自動投擲を待ちます');
+            }
+            for (const [wait, name] of [[700, '03-prep'], [1500, '04-flight'], [2500, '05-settle']]) {
+              await page.waitForTimeout(wait);
+              await shot(name);
+            }
+            // 結果が出る (ロール中の表示が消える) まで待つ
+            await page.waitForFunction(() => !document.body.innerText.includes('ロール中'), null, { timeout: 60000 }).catch(() => note('ロール中の表示が 60 秒以内に消えませんでした'));
+            await page.waitForTimeout(600);
+            await shot('06-result');
+            note(`結果画面まで到達 (${Date.now() - t0}ms)`);
+          } catch (e) {
+            errors.push(`script: ${e.message}`);
+            await shot('99-failure').catch(() => {});
+          }
+          await browser.close();
+
+          const report = [
+            '# smoke test',
+            ...notes,
+            '',
+            `errors: ${errors.length}`,
+            ...errors.map((s) => `  - ${s}`),
+            `warnings: ${warnings.length}`,
+            ...[...new Set(warnings)].slice(0, 20).map((s) => `  - ${s}`),
+          ].join('\n');
+          writeFileSync(`${outDir}/smoke-report.txt`, report);
+          console.log(report);
+          process.exit(errors.length > 0 ? 1 : 0);
+          EOF
+          cd "$RUNNER_TEMP/pw"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+          node smoke.mjs "$GITHUB_WORKSPACE/dist-html/chinchiro.html" "$GITHUB_WORKSPACE/smoke"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p smoke
+          cp -f mesh.log lint.log physics.log smoke/ 2>/dev/null || true
+
+      - name: Upload artifact (smoke-test)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test
+          path: smoke/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## チンチロ HTML ビルド'
+            echo
+            echo '| ステップ | 結果 |'
+            echo '| --- | --- |'
+            echo "| Vite ビルド | ${{ steps.build.outcome }} |"
+            echo "| 単一 HTML 化 | ${{ steps.inline.outcome }} |"
+            echo "| 描画メッシュ検証 (verify:mesh) | ${{ steps.mesh.outcome }} |"
+            echo "| 型検査 (lint) | ${{ steps.lint.outcome }} |"
+            echo "| 物理の簡易検証 (verify:physics --quick) | ${{ steps.physics.outcome }} |"
+            echo "| ブラウザ起動テスト | ${{ steps.smoke.outcome }} |"
+            echo
+            if [ -f dist-html/chinchiro.html ]; then
+              echo "成果物: \`chinchiro.html\` ($(du -h dist-html/chinchiro.html | cut -f1)) → 下の **Artifacts → chinchiro-html**"
+            fi
+            if [ -f smoke/smoke-report.txt ]; then
+              echo
+              echo '<details><summary>ブラウザ起動テストの結果</summary>'
+              echo
+              echo '```'
+              cat smoke/smoke-report.txt
+              echo '```'
+              echo '</details>'
+            fi
+            if [ -f physics.log ]; then
+              echo
+              echo '<details><summary>物理の簡易検証の出力</summary>'
+              echo
+              echo '```'
+              head -n 60 physics.log
+              echo '```'
+              echo '</details>'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Attach to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Release への添付に必要
+    steps:
+      - name: Download chinchiro.html
+        uses: actions/download-artifact@v4
+        with:
+          name: chinchiro-html
+          path: out
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/chinchiro.html
+          generate_release_notes: true
