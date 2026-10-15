@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 画面の四隅を落とす (吊り灯の下の盆の雰囲気) */
+.vignette {
+  background: radial-gradient(ellipse at 50% 46%, transparent 50%, rgba(0, 0, 0, 0.62) 100%);
+}
+
+/*
+ * 既存コンポーネントが使っている `animate-in` 系のクラス。
+ * tailwindcss-animate / tw-animate-css が未導入のため何も起きていなかったので、ここで実体を用意する。
+ */
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-in {
+  animation: pop-in 0.26s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+/* ノッチ付き端末で端末の安全領域を避ける */
+@supports (padding: env(safe-area-inset-top)) {
+  .safe-pad {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* 動きを減らす設定を尊重 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
